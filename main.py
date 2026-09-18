@@ -27,9 +27,10 @@ SEED = 42
 
 DATASET_PATH = "dataset/STS-B"
 
-MODEL_NAME = "cross-encoder/ms-marco-TinyBERT-L2-v2"
+# NLI-pretrained model
+MODEL_NAME = "cross-encoder/nli-distilroberta-base"
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 EPOCHS = 2
 MAX_LENGTH = 128
 LEARNING_RATE = 2e-5
@@ -39,7 +40,7 @@ torch.manual_seed(SEED)
 
 
 # ============================================================
-# 2. LOAD DATASET
+# 2. LOAD STS-B DATASET
 # ============================================================
 
 print("\n========== LOADING DATASET ==========")
@@ -58,8 +59,7 @@ validation = pd.read_csv(
     on_bad_lines="skip"
 )
 
-
-# Keep required columns
+# Keep only required columns
 train = train[
     ["sentence1", "sentence2", "score"]
 ].copy()
@@ -79,7 +79,7 @@ train["sentence2"] = train["sentence2"].fillna("")
 validation["sentence1"] = validation["sentence1"].fillna("")
 validation["sentence2"] = validation["sentence2"].fillna("")
 
-
+# Convert scores to numeric
 train["score"] = pd.to_numeric(
     train["score"],
     errors="coerce"
@@ -90,7 +90,7 @@ validation["score"] = pd.to_numeric(
     errors="coerce"
 )
 
-
+# Remove invalid scores
 train = train.dropna(
     subset=["score"]
 ).reset_index(drop=True)
@@ -98,7 +98,6 @@ train = train.dropna(
 validation = validation.dropna(
     subset=["score"]
 ).reset_index(drop=True)
-
 
 print("Training samples   :", len(train))
 print("Validation samples :", len(validation))
@@ -119,21 +118,22 @@ print(train.iloc[0]["sentence2"])
 print("\nOriginal similarity score:")
 print(train.iloc[0]["score"])
 
+# STS-B scores range from 0 to 5.
+# BinaryCrossEntropyLoss uses a 0 to 1 target.
+train["label"] = (
+    train["score"].astype(float) / 5.0
+)
 
-# ------------------------------------------------------------
-# Normalize STS score from 0-5 to 0-1
-# ------------------------------------------------------------
-
-train["label"] = train["score"] / 5.0
-validation["label"] = validation["score"] / 5.0
-
+validation["label"] = (
+    validation["score"].astype(float) / 5.0
+)
 
 print("\nNormalized similarity score:")
 print(train.iloc[0]["label"])
 
 
 # ============================================================
-# 5. CREATE HUGGING FACE DATASETS
+# 5. CREATE HUGGING FACE DATASET
 # ============================================================
 
 print("\n========== CREATING TRAINING DATA ==========")
@@ -145,44 +145,45 @@ train_dataset = Dataset.from_pandas(
     preserve_index=False
 )
 
-validation_dataset = Dataset.from_pandas(
-    validation[
-        ["sentence1", "sentence2", "label"]
-    ],
-    preserve_index=False
-)
-
-print("Training pairs   :", len(train_dataset))
-print("Validation pairs :", len(validation_dataset))
+print("Training pairs:", len(train_dataset))
 
 
 # ============================================================
-# 6. LOAD TRANSFORMER
+# 6. LOAD NLI-PRETRAINED TRANSFORMER
 # ============================================================
 
 print("\n========== LOADING TRANSFORMER ==========")
 
 model = CrossEncoder(
     MODEL_NAME,
+
+    # We need one output score for STS.
     num_labels=1,
+
     max_length=MAX_LENGTH,
+
+    # STS target is continuous after normalization.
+    activation_fn=torch.nn.Sigmoid(),
+
+    # NLI checkpoint originally has a 3-class head.
+    # Replace that head with a single-output head.
+    model_kwargs={
+        "ignore_mismatched_sizes": True
+    },
+
     device="cpu"
 )
 
 print("Model:", MODEL_NAME)
 print("Task : Semantic Text Similarity")
+print("Base : Natural Language Inference")
 
 
 # ============================================================
 # 7. LOSS FUNCTION
 # ============================================================
 
-# Official STS-style setup:
-# normalized labels 0-1 + Binary Cross Entropy
-
-loss = losses.BinaryCrossEntropyLoss(
-    model
-)
+loss = losses.BinaryCrossEntropyLoss(model)
 
 
 # ============================================================
@@ -216,7 +217,7 @@ evaluator = CrossEncoderCorrelationEvaluator(
 # ============================================================
 
 training_args = CrossEncoderTrainingArguments(
-    output_dir="semantic_similarity_transformer",
+    output_dir="semantic_similarity_nli_transformer",
 
     num_train_epochs=EPOCHS,
 
@@ -274,14 +275,16 @@ print("\nTraining completed.")
 # 12. SAVE MODEL
 # ============================================================
 
-model.save(
-    "semantic_similarity_transformer"
+MODEL_OUTPUT = (
+    "semantic_similarity_nli_transformer"
 )
 
-print(
-    "\nModel saved to:"
-    "\nsemantic_similarity_transformer"
+model.save_pretrained(
+    MODEL_OUTPUT
 )
+
+print("\nModel saved to:")
+print(MODEL_OUTPUT)
 
 
 # ============================================================
@@ -292,15 +295,12 @@ print("\n========== VALIDATION ==========")
 
 results = evaluator(model)
 
-print(
-    f"Pearson : "
-    f"{results[evaluator.primary_metric if 'pearson' in evaluator.primary_metric else list(results.keys())[0]]:.4f}"
-)
-
-print("Full evaluator results:")
+print("Evaluator results:")
 
 for key, value in results.items():
-    print(f"{key}: {value:.4f}")
+    print(
+        f"{key}: {value:.4f}"
+    )
 
 
 # ============================================================
@@ -311,8 +311,11 @@ print("\n========== VALIDATION PREDICTIONS ==========")
 
 predicted_normalized = model.predict(
     validation_pairs,
+
     batch_size=BATCH_SIZE,
+
     show_progress_bar=True,
+
     activation_fn=torch.nn.Sigmoid()
 )
 
@@ -321,10 +324,16 @@ predicted_normalized = np.asarray(
     dtype=np.float32
 )
 
-
-# Convert 0-1 to 0-5
+# Convert 0-1 back to original 0-5 scale
 predicted_scores = (
     predicted_normalized * 5.0
+)
+
+# Keep predictions within valid STS-B range
+predicted_scores = np.clip(
+    predicted_scores,
+    0.0,
+    5.0
 )
 
 actual_scores = (
@@ -341,7 +350,6 @@ actual_scores = (
 print("\n========== SAMPLE PREDICTIONS ==========")
 
 for i in range(10):
-
     print(
         f"Actual: {actual_scores[i]:.2f} | "
         f"Predicted: {predicted_scores[i]:.2f}"
@@ -374,7 +382,6 @@ spearman = pd.Series(
     method="spearman"
 )
 
-
 print("\n========== MODEL PERFORMANCE ==========")
 
 print(f"MAE      : {mae:.4f}")
@@ -387,7 +394,9 @@ print(f"Spearman : {spearman:.4f}")
 # 17. ACTUAL VS PREDICTED GRAPH
 # ============================================================
 
-plt.figure(figsize=(7, 6))
+plt.figure(
+    figsize=(7, 6)
+)
 
 plt.scatter(
     actual_scores,
@@ -414,6 +423,7 @@ plt.title(
 )
 
 plt.xlim(0, 5)
+
 plt.ylim(0, 5)
 
 plt.grid()
@@ -421,7 +431,7 @@ plt.grid()
 plt.tight_layout()
 
 plt.savefig(
-    "transformer_actual_vs_predicted.png",
+    "nli_transformer_actual_vs_predicted.png",
     dpi=300
 )
 
@@ -438,15 +448,14 @@ def predict_similarity(
 ):
 
     pair = [
-        (
-            sentence1,
-            sentence2
-        )
+        (sentence1, sentence2)
     ]
 
     normalized_score = model.predict(
         pair,
+
         show_progress_bar=False,
+
         activation_fn=torch.nn.Sigmoid()
     )[0]
 
@@ -455,9 +464,12 @@ def predict_similarity(
     )
 
     score = float(
-        np.clip(score, 0, 5)
+        np.clip(
+            score,
+            0.0,
+            5.0
+        )
     )
-
 
     if score >= 4.0:
 
@@ -476,7 +488,9 @@ def predict_similarity(
         interpretation = "Low Similarity"
 
 
-    print("\n========== CUSTOM TEST ==========")
+    print(
+        "\n========== CUSTOM TEST =========="
+    )
 
     print(
         "Sentence 1:",
